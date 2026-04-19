@@ -61,6 +61,22 @@ class ToolExecutionResult:
 
 
 @dataclass(slots=True)
+class StreamedChatResult:
+    """一次流式 Chat Completions 调用聚合后的结果。"""
+
+    message: dict[str, Any]
+    streamed_to_console: bool = False
+
+
+@dataclass(slots=True)
+class AgentLoopResult:
+    """Agent Loop 的最终输出。"""
+
+    reply: str
+    streamed_to_console: bool = False
+
+
+@dataclass(slots=True)
 class TraceSettings:
     """控制终端摘要输出和 HTML 轨迹查看器。"""
 
@@ -1063,6 +1079,72 @@ def parse_tool_arguments(raw_arguments: str) -> dict[str, Any]:
     return parsed
 
 
+def get_value(obj: Any, name: str, default: Any = None) -> Any:
+    """同时兼容 SDK 对象和字典两种访问方式。"""
+
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def message_to_dict(message: Any) -> dict[str, Any]:
+    """把 SDK 返回的消息对象统一转换成字典。"""
+
+    if isinstance(message, dict):
+        return message
+    if hasattr(message, "model_dump"):
+        return message.model_dump(exclude_none=True)
+    return {"content": get_value(message, "content", ""), "role": get_value(message, "role", "assistant")}
+
+
+def get_message_tool_calls(message: Any) -> list[Any]:
+    """从消息中提取 tool calls。"""
+
+    return get_value(message_to_dict(message), "tool_calls", []) or []
+
+
+def get_tool_call_id(tool_call: Any) -> str:
+    """提取 tool call id。"""
+
+    return str(get_value(tool_call, "id", ""))
+
+
+def get_tool_call_function(tool_call: Any) -> Any:
+    """提取 tool call 的 function 对象。"""
+
+    return get_value(tool_call, "function", {})
+
+
+def get_tool_call_name(tool_call: Any) -> str:
+    """提取 tool call 对应的工具名。"""
+
+    return str(get_value(get_tool_call_function(tool_call), "name", ""))
+
+
+def get_tool_call_arguments(tool_call: Any) -> str:
+    """提取 tool call 的原始参数 JSON 字符串。"""
+
+    return str(get_value(get_tool_call_function(tool_call), "arguments", "") or "")
+
+
+def extract_delta_text(delta_content: Any) -> str:
+    """从流式 delta 中尽量提取文本内容。"""
+
+    if isinstance(delta_content, str):
+        return delta_content
+
+    if isinstance(delta_content, list):
+        text_parts: list[str] = []
+        for item in delta_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(str(item.get("text", "")))
+        return "".join(text_parts)
+
+    return ""
+
+
 def extract_text_content(content: Any) -> str:
     """兼容不同响应格式，尽量提取出最终可展示文本。"""
 
@@ -1123,6 +1205,95 @@ def execute_tool_call(tool_name: str, raw_arguments: str) -> ToolExecutionResult
         )
 
 
+def create_streamed_chat_completion(
+    client: Any,
+    model: str,
+    messages: list[dict[str, Any]],
+    tool_schemas: list[dict[str, Any]],
+) -> StreamedChatResult:
+    """以流式方式调用 Chat Completions，并聚合成完整 assistant message。"""
+
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=tool_schemas,
+        stream=True,
+    )
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    streamed_to_console = False
+    streamed_prefix_printed = False
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
+
+    for chunk in stream:
+        choices = get_value(chunk, "choices", []) or []
+        if not choices:
+            continue
+
+        choice = choices[0]
+        delta = get_value(choice, "delta")
+        if delta is None:
+            continue
+
+        delta_content = extract_delta_text(get_value(delta, "content"))
+        if delta_content:
+            content_parts.append(delta_content)
+            if not streamed_prefix_printed:
+                print("\nAgent> ", end="", flush=True)
+                streamed_prefix_printed = True
+            print(delta_content, end="", flush=True)
+            streamed_to_console = True
+
+        reasoning_delta = get_value(delta, "reasoning_content")
+        if reasoning_delta:
+            reasoning_parts.append(str(reasoning_delta))
+
+        delta_tool_calls = get_value(delta, "tool_calls", []) or []
+        for raw_tool_call in delta_tool_calls:
+            index = int(get_value(raw_tool_call, "index", 0) or 0)
+            tool_call = tool_calls_by_index.setdefault(
+                index,
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                },
+            )
+
+            tool_call_id = get_value(raw_tool_call, "id")
+            if tool_call_id:
+                tool_call["id"] = str(tool_call_id)
+
+            tool_call_type = get_value(raw_tool_call, "type")
+            if tool_call_type:
+                tool_call["type"] = str(tool_call_type)
+
+            raw_function = get_value(raw_tool_call, "function")
+            if raw_function:
+                function_name = get_value(raw_function, "name")
+                if function_name:
+                    tool_call["function"]["name"] = str(function_name)
+
+                function_arguments = get_value(raw_function, "arguments")
+                if function_arguments:
+                    tool_call["function"]["arguments"] += str(function_arguments)
+
+    if streamed_to_console:
+        print()
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+    }
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls_by_index:
+        message["tool_calls"] = [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)]
+
+    return StreamedChatResult(message=message, streamed_to_console=streamed_to_console)
+
+
 def visualize_request(
     turn: int,
     model: str,
@@ -1149,12 +1320,13 @@ def visualize_request(
 def visualize_response(turn: int, message: Any, recorder: TraceRecorder) -> None:
     """记录当前轮次模型返回的原始消息。"""
 
-    tool_calls = message.tool_calls or []
+    message_dict = message_to_dict(message)
+    tool_calls = get_message_tool_calls(message_dict)
     if tool_calls:
-        tool_names = ", ".join(tool_call.function.name for tool_call in tool_calls)
+        tool_names = ", ".join(get_tool_call_name(tool_call) for tool_call in tool_calls)
         summary = f"[Turn {turn}] LLM 请求 {len(tool_calls)} 个工具: {tool_names}"
     else:
-        final_text = extract_text_content(message.content)
+        final_text = extract_text_content(message_dict.get("content"))
         summary = f"[Turn {turn}] LLM 生成最终答复，长度 {len(final_text)} chars"
 
     emit_trace_event(
@@ -1162,7 +1334,7 @@ def visualize_response(turn: int, message: Any, recorder: TraceRecorder) -> None
         kind="llm-response",
         title=f"Turn {turn} | LLM Response",
         summary=summary,
-        payload=message.model_dump(exclude_none=True),
+        payload=message_dict,
     )
 
 
@@ -1170,14 +1342,14 @@ def visualize_tool_call(turn: int, tool_call: Any, recorder: TraceRecorder) -> N
     """记录模型请求调用的工具及参数。"""
 
     try:
-        arguments: Any = parse_tool_arguments(tool_call.function.arguments)
+        arguments: Any = parse_tool_arguments(get_tool_call_arguments(tool_call))
     except ValueError:
-        arguments = tool_call.function.arguments
+        arguments = get_tool_call_arguments(tool_call)
 
     payload = {
         "turn": turn,
-        "tool_call_id": tool_call.id,
-        "tool_name": tool_call.function.name,
+        "tool_call_id": get_tool_call_id(tool_call),
+        "tool_name": get_tool_call_name(tool_call),
         "arguments": arguments,
     }
     emit_trace_event(
@@ -1185,7 +1357,7 @@ def visualize_tool_call(turn: int, tool_call: Any, recorder: TraceRecorder) -> N
         kind="tool-call",
         title=f"Turn {turn} | Tool Call",
         summary=(
-            f"[Turn {turn}] 调用工具 {tool_call.function.name} "
+            f"[Turn {turn}] 调用工具 {get_tool_call_name(tool_call)} "
             f"{one_line_preview(arguments, max_chars=120)}"
         ),
         payload=payload,
@@ -1257,57 +1429,62 @@ def agent_loop(
     client: Any,
     model: str,
     recorder: TraceRecorder,
-) -> str:
+) -> AgentLoopResult:
     """运行文章中提到的极简 ReAct Agent Loop。"""
 
     # 用户输入先进入上下文，后续每一轮都在这份 messages 上追加观察结果。
     messages.append({"role": "user", "content": user_message})
+    tool_schemas = [tool.schema for tool in TOOLS.values()]
 
     for _turn in range(1, MAX_TURNS + 1):
         # 1. 让模型基于当前上下文推理，并决定是否调用工具。
         visualize_request(turn=_turn, model=model, messages=messages, recorder=recorder)
-        response = client.chat.completions.create(
+        streamed_result = create_streamed_chat_completion(
+            client=client,
             model=model,
             messages=messages,
-            tools=[tool.schema for tool in TOOLS.values()],
+            tool_schemas=tool_schemas,
         )
-        message = response.choices[0].message
+        message = streamed_result.message
         visualize_response(turn=_turn, message=message, recorder=recorder)
-        messages.append(message.model_dump(exclude_none=True))
+        messages.append(message)
 
         # 2. 如果模型不再请求工具，说明它准备直接给最终答案了。
-        tool_calls = message.tool_calls or []
+        tool_calls = get_message_tool_calls(message)
         if not tool_calls:
-            return extract_text_content(message.content)
+            return AgentLoopResult(
+                reply=extract_text_content(message.get("content")),
+                streamed_to_console=streamed_result.streamed_to_console,
+            )
 
         # 3. 逐个执行工具，并把工具观察结果写回上下文，供下一轮继续推理。
         for tool_call in tool_calls:
             visualize_tool_call(turn=_turn, tool_call=tool_call, recorder=recorder)
             tool_result = execute_tool_call(
-                tool_name=tool_call.function.name,
-                raw_arguments=tool_call.function.arguments,
+                tool_name=get_tool_call_name(tool_call),
+                raw_arguments=get_tool_call_arguments(tool_call),
             )
             visualize_tool_execution(
                 turn=_turn,
-                tool_name=tool_call.function.name,
+                tool_name=get_tool_call_name(tool_call),
                 execution=tool_result.execution,
                 recorder=recorder,
             )
             visualize_tool_result(
                 turn=_turn,
-                tool_name=tool_call.function.name,
+                tool_name=get_tool_call_name(tool_call),
                 result=tool_result.content,
                 recorder=recorder,
             )
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": get_tool_call_id(tool_call),
                     "content": tool_result.content,
                 }
             )
 
-    return f"[agent] reached maximum turns ({MAX_TURNS}), stopping."
+    return AgentLoopResult(reply=f"[agent] reached maximum turns ({MAX_TURNS}), stopping.")
 
 
 def run_repl() -> int:
@@ -1394,8 +1571,11 @@ def run_repl() -> int:
             print()
             continue
 
-        reply = agent_loop(user_input, messages, client, settings.model, recorder)
-        print(f"\nAgent> {reply}\n")
+        result = agent_loop(user_input, messages, client, settings.model, recorder)
+        if result.streamed_to_console:
+            print()
+        else:
+            print(f"\nAgent> {result.reply}\n")
 
 
 def main() -> int:
