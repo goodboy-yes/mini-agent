@@ -12,6 +12,7 @@
 - `file_read` 和 `file_write` 默认限制在当前工作区，避免把相对路径写到别处
 - 模型配置改成环境变量驱动，既能直接用 DeepSeek，也能接 OpenAI 兼容接口
 - 启动时会自动尝试读取当前目录下的 `.env` 文件
+- 终端默认只显示精简进度摘要，完整轨迹会同步写入可折叠的 HTML 查看器
 
 ## Files
 
@@ -33,6 +34,10 @@ python -m pip install -r requirements.txt
 AGENT_API_KEY=your-key
 AGENT_BASE_URL=https://your-openai-compatible-endpoint
 AGENT_MODEL=your-model-name
+AGENT_TRACE_CONSOLE=summary
+AGENT_TRACE_HTML=1
+AGENT_TRACE_MAX_CHARS=4000
+AGENT_TRACE_HTML_MAX_CHARS=20000
 ```
 
 ### 方案 1：直接按文章里的 DeepSeek 方式运行
@@ -80,6 +85,35 @@ python agent.py
 
 - `clear`：清空当前会话上下文，但保留 system prompt
 - `exit`：退出 REPL
+- `trace summary`：终端显示精简摘要，同时保留 HTML 轨迹
+- `trace full`：终端显示完整区块日志，同时保留 HTML 轨迹
+- `trace silent`：终端不打印轨迹，只写入 HTML 轨迹
+- `trace off`：关闭执行轨迹可视化
+- `trace path`：显示当前 HTML 轨迹文件路径
+
+程序启动后会生成 `.agent-traces/latest.html`，你可以在浏览器里打开它。每个事件都是可折叠面板，适合查看长请求、长回复和工具结果。
+为了让热更新更稳定，Agent 运行时还会启动一个本地 HTTP 查看器，并在控制台打印 `Live viewer URL`。
+现在页面只会在 trace 真正发生变更时刷新，不再按固定时间整页刷新，并尽量保留你的展开状态和滚动位置。
+如果你直接用浏览器打开 `latest.html`，页面会自动跳转到本地查看器；如果你是在 IDE 的源码标签页里看文件内容，那依然不会自动刷新，因为那不是实际执行 HTML/JS 的页面。
+
+HTML 轨迹里会记录以下区块：
+
+- `LLM Request`：当前轮次发给模型的请求参数
+- `LLM Response`：模型返回的原始消息
+- `Tool Call`：模型请求调用的工具与参数
+- `Tool Execution`：工具真正映射到本机后的执行命令或文件操作
+- `Tool Result`：工具实际执行结果
+
+如果你想调节终端和 HTML 的输出长度，可以通过 `.env` 或系统环境变量配置：
+
+```env
+AGENT_TRACE_CONSOLE=summary
+AGENT_TRACE_HTML=1
+AGENT_TRACE_MAX_CHARS=2000
+AGENT_TRACE_HTML_MAX_CHARS=12000
+```
+
+如果你是在 IDE 里直接打开 HTML 源码文件标签页，那通常不会自动刷新，因为那是文本编辑器视图，不是浏览器/预览器视图。要看到热更新，请用浏览器打开 `latest.html`，或使用 IDE 的 HTML Preview。
 
 ## Notes
 
